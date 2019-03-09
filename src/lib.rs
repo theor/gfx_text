@@ -128,6 +128,7 @@ pub struct Renderer<R: Resources, F: Factory<R>> {
     vertex_buffer: Buffer<R, Vertex>,
     index_data: Vec<IndexT>,
     index_buffer: Buffer<R, IndexT>,
+    locals: gfx::handle::Buffer<R, Locals>,
     font_bitmap: BitmapFont,
     color: (gfx::handle::ShaderResourceView<R, f32>, gfx::handle::Sampler<R>),
 }
@@ -226,9 +227,11 @@ impl<'r, R: Resources, F: Factory<R>> RendererBuilder<'r, R, F> {
     }
 
     /// Build a new text renderer instance using current settings.
-    pub fn build(mut self) -> Result<Renderer<R, F>, Error> {
+    pub fn build(mut self, vertex_src: &[u8], pixel_src: &[u8]) -> Result<Renderer<R, F>, Error> {
         use gfx::buffer;
         use gfx::memory;
+
+        let locals = self.factory.create_constant_buffer(1);
 
         let vertex_buffer = self.factory.create_buffer(
             self.buffer_size,
@@ -266,7 +269,7 @@ impl<'r, R: Resources, F: Factory<R>> RendererBuilder<'r, R, F> {
                                   texture::WrapMode::Clamp)
         );
 
-        let shaders = try!(self.factory.create_shader_set(VERTEX_SRC, FRAGMENT_SRC));
+        let shaders = try!(self.factory.create_shader_set(vertex_src, pixel_src));
 
         Ok(Renderer {
             factory: self.factory,
@@ -276,32 +279,32 @@ impl<'r, R: Resources, F: Factory<R>> RendererBuilder<'r, R, F> {
             vertex_buffer: vertex_buffer,
             index_data: Vec::new(),
             index_buffer: index_buffer,
+            locals,
             font_bitmap: font_bitmap,
             color: (font_texture, sampler),
         })
     }
 
     /// Just an alias for `builder.build().unwrap()`.
-    pub fn unwrap(self) -> Renderer<R, F> {
-        self.build().unwrap()
+    pub fn unwrap(self, vertex_src: &[u8], pixel_src: &[u8]) -> Renderer<R, F> {
+        self.build(vertex_src, pixel_src).unwrap()
     }
 }
 
 impl<R: Resources, F: Factory<R>> Renderer<R, F> {
     fn prepare_pso(&mut self, format: gfx::format::Format) -> Result<(), Error> {
         Ok(if let Entry::Vacant(e) = self.pso_map.entry(format) {
-            let init = pipe::Init {
-                vbuf: (),
-                screen_size: "u_Screen_Size",
-                proj: "u_Proj",
-                color: "t_Color",
-                out_color: ("o_Color", format, gfx::state::ColorMask::all(), Some(gfx::preset::blend::ALPHA)),
-            };
+            // let init = pipe::Init {
+            //     vbuf: (),
+            //     locals: "Locals",
+            //     color: "t_Color",
+            //     out_color: ("Target0", ),//("o_Color", format, gfx::state::ColorMask::all(), Some(gfx::preset::blend::ALPHA)),
+            // };
             let pso = try!(self.factory.create_pipeline_state(
                 &self.shaders,
                 gfx::Primitive::TriangleList,
                 gfx::state::Rasterizer::new_fill().with_cull_back(),
-                init
+                pipe::new(),
             ));
             e.insert(pso);
         })
@@ -424,10 +427,10 @@ impl<R: Resources, F: Factory<R>> Renderer<R, F> {
     /// text.add("Test2", [20, 20], [0.0, 1.0, 0.0, 1.0]);
     /// text.draw(&mut encoder, &color_output).unwrap();
     /// ```
-    pub fn draw<C: CommandBuffer<R>, T: gfx::format::RenderFormat>(
+    pub fn draw<C: CommandBuffer<R>>(
         &mut self,
         encoder: &mut Encoder<R, C>,
-        target: &RenderTargetView<R, T>
+        target: &RenderTargetView<R, gfx::format::Rgba8>
     ) -> Result<(), Error> {
         self.draw_at(encoder, target, DEFAULT_PROJECTION)
     }
@@ -441,10 +444,10 @@ impl<R: Resources, F: Factory<R>> Renderer<R, F> {
     /// text.add_at("Test2", [0.0, 5.0, 0.0], [0.0, 1.0, 0.0, 1.0]);
     /// text.draw_at(&mut encoder, &color_output, camera_projection).unwrap();
     /// ```
-    pub fn draw_at<C: CommandBuffer<R>, T: gfx::format::RenderFormat>(
+    pub fn draw_at<C: CommandBuffer<R>>(
         &mut self,
         encoder: &mut Encoder<R, C>,
-        target: &RenderTargetView<R, T>,
+        target: &RenderTargetView<R, gfx::format::Rgba8>,
         proj: [[f32; 4]; 4]
     ) -> Result<(), Error> {
         use gfx::memory::{self, Typed};
@@ -484,21 +487,28 @@ impl<R: Resources, F: Factory<R>> Renderer<R, F> {
 
         let data = pipe::Data {
             vbuf: self.vertex_buffer.clone(),
+            locals: self.locals.clone(),
+            color: self.color.clone(),
+            out_color: target.clone(),
+        };
+
+        try!(self.prepare_pso(<gfx::format::Rgba8 as gfx::format::Formatted>::get_format()));
+        let pso = &self.pso_map[&<gfx::format::Rgba8 as gfx::format::Formatted>::get_format()];
+
+        // Clear state.
+        self.vertex_data.clear();
+        self.index_data.clear();
+
+        
+        let locals = Locals {      
             proj: proj,
             screen_size: {
                 let (w, h, _, _) = target.get_dimensions();
                 [w as f32, h as f32]
             },
-            color: self.color.clone(),
-            out_color: target.raw().clone(),
         };
 
-        try!(self.prepare_pso(T::get_format()));
-        let pso = &self.pso_map[&T::get_format()];
-
-        // Clear state.
-        self.vertex_data.clear();
-        self.index_data.clear();
+        encoder.update_constant_buffer(&data.locals, &locals);
 
         encoder.draw(&slice, pso, &data);
         Ok(())
@@ -558,68 +568,39 @@ fn create_texture_r8_static<R: Resources, F: Factory<R>>(
 mod shader_structs {
     extern crate gfx;
 
-    gfx_vertex_struct!( Vertex {
-        pos: [f32; 2] = "a_Pos",
-        tex: [f32; 2] = "a_TexCoord",
-        world_pos: [f32; 3] = "a_World_Pos",
-        // Should be bool but gfx-rs doesn't support it.
-        screen_rel: i32 = "a_Screen_Rel",
-        color: [f32; 4] = "a_Color",
-    });
+    gfx_defines! {
+        vertex Vertex {
+            pos: [f32; 2] = "a_Pos",
+            tex: [f32; 2] = "a_TexCoord",
+            world_pos: [f32; 3] = "a_World_Pos",
+            // Should be bool but gfx-rs doesn't support it.
+            screen_rel: i32 = "a_Screen_Rel",
+            color: [f32; 4] = "a_Color",
+        }
 
-    gfx_pipeline_base!( pipe {
-        vbuf: gfx::VertexBuffer<Vertex>,
-        screen_size: gfx::Global<[f32; 2]>,
-        proj: gfx::Global<[[f32; 4]; 4]>,
-        color: gfx::TextureSampler<f32>,
-        out_color: gfx::RawRenderTarget,
-    });
+        constant Locals {
+            proj: [[f32; 4]; 4] = "u_Proj",
+            screen_size: [f32; 2] = "u_Screen_Size",
+        }
+
+        pipeline pipe {
+            vbuf: gfx::VertexBuffer<Vertex> = (),
+            locals: gfx::ConstantBuffer<Locals> = "Locals",
+            color: gfx::TextureSampler<f32> = "t_Color",
+            out_color: gfx::BlendTarget<gfx::format::Rgba8> = ("Target0", gfx::state::ColorMask::all(), gfx::preset::blend::ALPHA),
+            // out_color: gfx::RenderTarget<gfx::format::Rgba8> = "Target0",
+
+            // vbuf: gfx::VertexBuffer<Vertex> = (),
+            // transform: gfx::Global<[[f32; 4]; 4]> = "u_Transform",
+            // screen: gfx::Global<[f32; 2]> = "u_Screen",
+            // locals: gfx::ConstantBuffer<Locals> = "Locals",
+            // color: gfx::TextureSampler<[f32; 4]> = "t_Color",
+            // out_color: gfx::RenderTarget<ColorFormat> = "Target0",
+            // out_depth: gfx::DepthTarget<DepthFormat> =
+            //     gfx::preset::depth::LESS_EQUAL_WRITE,
+        }
+    }
 }
 use shader_structs::{Vertex, pipe};
+use shader_structs::Locals;
 
-const VERTEX_SRC: &'static [u8] = b"
-    #version 150 core
-
-    in vec2 a_Pos;
-    in vec4 a_Color;
-    in vec2 a_TexCoord;
-    in vec4 a_World_Pos;
-    in int a_Screen_Rel;
-    out vec4 v_Color;
-    out vec2 v_TexCoord;
-    uniform vec2 u_Screen_Size;
-    uniform mat4 u_Proj;
-
-    void main() {
-        // On-screen offset from text origin.
-        vec2 v_Screen_Offset = vec2(
-            2 * a_Pos.x / u_Screen_Size.x - 1,
-            1 - 2 * a_Pos.y / u_Screen_Size.y
-        );
-        vec4 v_Screen_Pos = u_Proj * a_World_Pos;
-        vec2 v_World_Offset = a_Screen_Rel == 0
-            // Perspective divide to get normalized device coords.
-            ? vec2 (
-                v_Screen_Pos.x / v_Screen_Pos.z + 1,
-                v_Screen_Pos.y / v_Screen_Pos.z - 1
-            ) : vec2(0.0, 0.0);
-
-        v_Color = a_Color;
-        v_TexCoord = a_TexCoord;
-        gl_Position = vec4(v_World_Offset + v_Screen_Offset, 0.0, 1.0);
-    }
-";
-
-const FRAGMENT_SRC: &'static [u8] = b"
-    #version 150 core
-
-    in vec4 v_Color;
-    in vec2 v_TexCoord;
-    out vec4 o_Color;
-    uniform sampler2D t_Color;
-
-    void main() {
-        vec4 t_Font_Color = texture(t_Color, v_TexCoord);
-        o_Color = vec4(v_Color.rgb, t_Font_Color.r * v_Color.a);
-    }
-";
