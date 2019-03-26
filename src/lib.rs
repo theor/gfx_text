@@ -23,7 +23,7 @@
 //! text.draw(&mut stream);
 //! ```
 
-#![deny(missing_docs)]
+// #![deny(missing_docs)]
 
 // #[macro_use]
 // extern crate log;
@@ -40,7 +40,7 @@ use gfx::pso::PipelineState;
 use gfx::texture;
 use gfx::traits::FactoryExt;
 mod font;
-use font::BitmapFont;
+pub use font::BitmapFont;
 pub use font::FontError;
 
 const DEFAULT_FONT_SIZE: u8 = 16;
@@ -294,12 +294,6 @@ impl<'r, R: Resources, F: Factory<R>> RendererBuilder<'r, R, F> {
 impl<R: Resources, F: Factory<R>> Renderer<R, F> {
     fn prepare_pso(&mut self, format: gfx::format::Format) -> Result<(), Error> {
         Ok(if let Entry::Vacant(e) = self.pso_map.entry(format) {
-            // let init = pipe::Init {
-            //     vbuf: (),
-            //     locals: "Locals",
-            //     color: "t_Color",
-            //     out_color: ("Target0", ),//("o_Color", format, gfx::state::ColorMask::all(), Some(gfx::preset::blend::ALPHA)),
-            // };
             let pso = try!(self.factory.create_pipeline_state(
                 &self.shaders,
                 gfx::Primitive::TriangleList,
